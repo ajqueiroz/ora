@@ -1,0 +1,80 @@
+Before you start
+Licence: a Power Automate Premium licence for the flow owner, because the Microsoft Defender ATP connector is premium.
+Account: ideally a service account with permission to run advanced hunting in Defender and a mailbox to send from. A flow tied to a personal account breaks if that person leaves.
+SharePoint folder: create one for the weekly evidence, for example Security → CIS 1.2 Evidence.
+Step 1: Create the scheduled flow
+Go to make.powerautomate.com → Create → Scheduled cloud flow.
+Name it CIS 1.2 - Weekly unauthorized asset report.
+Set Repeat every 1 Week, on Monday, then select Create.
+Open the Recurrence trigger and set Time zone and At these hours (for example 7) and minutes (0). Without this the flow runs at the time you created it, in UTC.
+Step 2: Run the hunting query
+Select + New step, search for Microsoft Defender ATP, and choose Advanced Hunting.
+Sign in with the service account when prompted.
+Paste this into Query:
+kql
+DeviceInfo
+| where Timestamp > ago(30d)
+| summarize FirstSeen = min(Timestamp), arg_max(Timestamp, *) by DeviceId
+| where OnboardingStatus != "Onboarded"
+| where not(tostring(DeviceManualTags) has "Authorized")
+| join kind=leftouter (
+    DeviceNetworkInfo
+    | where Timestamp > ago(30d)
+    | summarize arg_max(Timestamp, IPAddresses, MacAddress) by DeviceId
+  ) on DeviceId
+| extend NewThisWeek = iff(FirstSeen > ago(7d), "Yes", "No")
+| project DeviceName, DeviceCategory, DeviceType, Vendor, Model, OSPlatform,
+          OnboardingStatus, IPAddresses = tostring(IPAddresses), MacAddress,
+          FirstSeen, LastSeen = Timestamp, NewThisWeek
+| order by NewThisWeek desc, FirstSeen desc
+
+Run the query in the Defender portal first to check it returns what you expect. If the tag filter doesn’t work in your tenant, replace that line with a static allow-list: | where DeviceName !in~ ("printer-hq-01", "badge-reader-02").
+
+Step 3: Check whether anything was found
+Add a Condition action.
+In the left box, select Expression and enter:
+length(outputs('Advanced_Hunting')?['body/Results'])
+Set the operator to is greater than and the value to 0.
+
+If you renamed the Advanced Hunting step, use that name with spaces replaced by underscores.
+
+Step 4: “If yes” branch, build the report
+
+Add these actions inside If yes:
+
+Select (Data Operation)
+From: Results from Advanced Hunting (pick it from Dynamic content).
+Switch to text mode and map the columns you want in the email, for example:
+Device → item()?['DeviceName']
+Category → item()?['DeviceCategory']
+Type → item()?['DeviceType']
+Vendor → item()?['Vendor']
+IP → item()?['IPAddresses']
+MAC → item()?['MacAddress']
+First seen → item()?['FirstSeen']
+New this week → item()?['NewThisWeek']
+Create HTML table: From = the Output of Select.
+Create CSV table: From = the Output of Select.
+SharePoint → Create file
+Site address and Folder path: your evidence folder
+File name (expression): concat('CIS12_unauthorized_assets_', formatDateTime(utcNow(), 'yyyy-MM-dd'), '.csv')
+File content: the Output of Create CSV table
+Office 365 Outlook → Send an email (V2)
+To: your distribution list
+Subject (expression): concat('[CIS 1.2] Unauthorized assets - ', formatDateTime(utcNow(), 'yyyy-MM-dd'), ' - ', length(outputs('Advanced_Hunting')?['body/Results']), ' devices')
+Body: a one-line instruction, for example “Review each device within 5 business days: approve and tag Authorized, onboard, or block. Record the outcome in the review log.” Below it, insert the Output of Create HTML table.
+Step 5: “If no” branch, a clean-week email
+
+Add Send an email (V2) inside If no, to the same list, with the subject [CIS 1.2] No unauthorized assets found - <date>. Keep this branch: auditors want proof the review ran every week, not only on weeks with findings.
+
+Step 6: Get alerted if the flow fails
+Below the Condition, add Send an email (V2) to the security team, with the subject CIS 1.2 weekly report FAILED.
+On that action, open … → Configure run after, tick has failed and has timed out, and untick is successful.
+
+This way a broken connection or expired password doesn’t silently stop the reports.
+
+Step 7: Test and hand over
+Select Save, then Test → Manually → Run flow.
+Check that the email arrives, the device count matches the query in the Defender portal, and the CSV is in SharePoint.
+Tag one test device Authorized, run the flow again, and confirm the device disappears from the report.
+Under Share, add a second owner so the flow isn’t tied to one person.
